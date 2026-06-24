@@ -6,6 +6,7 @@ use soroban_sdk::{
 };
 
 use crate::{InvoiceContract, InvoiceContractClient, InvoiceStatus};
+use trusttrove_pool::PoolContractClient;
 
 #[contract]
 pub struct MockRegistry;
@@ -431,4 +432,50 @@ fn test_get_funding_asset_returns_correct_asset() {
 
     let asset = client.get_funding_asset(&invoice_id);
     assert_eq!(asset, usdc);
+}
+
+#[test]
+fn test_full_lifecycle_with_repayment() {
+    // Setup environment and contracts
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + 86400;
+    let invoice_id = client.create(&issuer, &buyer, &1_000_000_000u128, &due_date, &usdc);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Created);
+
+    // List for financing
+    client.list_for_financing(&invoice_id, &200);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Listed);
+
+    // Fund the invoice via pool
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let funded_amount: u128 = 980_000_000;
+    let result = client.mark_funded(&invoice_id, &pool, &usdc, &funded_amount);
+    assert!(result);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Funded);
+    assert_eq!(client.get(&invoice_id).funding_pool, Some(pool.clone()));
+
+    // Ship the invoice
+    client.mark_shipped(&invoice_id);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Active);
+
+    // Both parties confirm delivery
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Confirmed);
+
+    // Capture pool stats before repayment
+    let pool_client = PoolContractClient::new(&env, &pool);
+    let stats_before = pool_client.get_stats();
+    let total_yield_before = stats_before.total_yield_distributed;
+
+    // Repay the invoice
+    let repay_result = client.repay(&invoice_id);
+    assert!(repay_result);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Repaid);
+
+    // Verify pool yield increased after repayment
+    let pool_client = PoolContractClient::new(&env, &pool);
+    let stats_after = pool_client.get_stats();
+    assert!(stats_after.total_yield_distributed > total_yield_before);
 }

@@ -1333,6 +1333,7 @@ name = "trusttrove-invoice"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "trusttrove-pool",
 ]
 
 [[package]]
