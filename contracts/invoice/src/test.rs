@@ -2,11 +2,13 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, testutils::Ledger, Address,
-    BytesN, Env, Symbol,
+    BytesN, Env, Map, Symbol,
 };
 
 use crate::{InvoiceContract, InvoiceContractClient, InvoiceStatus};
-use trusttrove_pool::PoolContractClient;
+use trusttrove_escrow::{EscrowContract, EscrowContractClient};
+use trusttrove_pool::{PoolContract, PoolContractClient};
+use trusttrove_registry::{RegistryContract, RegistryContractClient};
 
 #[contract]
 pub struct MockRegistry;
@@ -89,6 +91,28 @@ fn mock_pool_with_asset(env: &Env, asset: &Address) -> Address {
     });
     pool_id
 }
+
+#[contract]
+pub struct MockToken;
+
+#[contractimpl]
+impl MockToken {
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let from_key = BalanceKey(from.clone());
+        let to_key = BalanceKey(to.clone());
+        let from_bal: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        let to_bal: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+        env.storage().persistent().set(&from_key, &(from_bal - amount));
+        env.storage().persistent().set(&to_key, &(to_bal + amount));
+    }
+
+    pub fn balance(env: Env, addr: Address) -> i128 {
+        env.storage().persistent().get(&BalanceKey(addr)).unwrap_or(0)
+    }
+}
+
+#[contracttype]
+pub struct BalanceKey(Address);
 
 #[test]
 fn test_create_invoice_with_verified_parties() {
@@ -435,47 +459,107 @@ fn test_get_funding_asset_returns_correct_asset() {
 }
 
 #[test]
-fn test_full_lifecycle_with_repayment() {
-    // Setup environment and contracts
-    let (env, client, issuer, buyer, _, usdc) = setup();
+fn test_full_lifecycle_integration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let lp = Address::generate(&env);
+
+    // Deploy and initialize registry
+    let registry_id = env.register_contract(None, RegistryContract);
+    let registry = RegistryContractClient::new(&env, &registry_id);
+    registry.initialize(&admin);
+    registry.register_issuer(&issuer, &Map::new(&env));
+    registry.register_buyer(&buyer, &Map::new(&env));
+    assert!(registry.is_verified(&issuer));
+    assert!(registry.is_verified(&buyer));
+
+    // Deploy mock USDC token and fund LP + buyer
+    let usdc_id = env.register_contract(None, MockToken);
+    env.as_contract(&usdc_id, || {
+        env.storage()
+            .persistent()
+            .set(&BalanceKey(lp.clone()), &100_000_000_000_000i128);
+        env.storage()
+            .persistent()
+            .set(&BalanceKey(buyer.clone()), &100_000_000_000_000i128);
+    });
+
+    // Deploy invoice
+    let invoice_id = env.register_contract(None, InvoiceContract);
+    let invoice = InvoiceContractClient::new(&env, &invoice_id);
+    invoice.initialize(&admin, &registry_id);
+
+    // Deploy escrow
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let escrow = EscrowContractClient::new(&env, &escrow_id);
+
+    // Deploy pool
+    let pool_id = env.register_contract(None, PoolContract);
+    let pool = PoolContractClient::new(&env, &pool_id);
+
+    // Wire everything together
+    pool.initialize(&admin, &invoice_id, &escrow_id, &usdc_id);
+    escrow.initialize(&admin, &pool_id, &invoice_id, &usdc_id);
+    invoice.set_pool_contract(&pool_id);
+
+    // LP deposits into pool
+    let deposit_amount: u128 = 100_000_000_000;
+    let shares = pool.deposit(&lp, &deposit_amount);
+    assert!(shares > 0);
+
+    let stats = pool.get_stats();
+    assert_eq!(stats.total_deposits, deposit_amount);
+    assert_eq!(stats.active_invoice_count, 0);
+
+    // Create invoice
+    let face_value: u128 = 10_000_000_000;
     let due_date = env.ledger().timestamp() + 86400;
-    let invoice_id = client.create(&issuer, &buyer, &1_000_000_000u128, &due_date, &usdc);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Created);
+    let inv_id = invoice.create(&issuer, &buyer, &face_value, &due_date, &usdc_id);
+    assert_eq!(invoice.get_status(&inv_id), InvoiceStatus::Created as u32);
 
     // List for financing
-    client.list_for_financing(&invoice_id, &200);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Listed);
+    invoice.list_for_financing(&inv_id, &200);
+    assert_eq!(invoice.get_status(&inv_id), InvoiceStatus::Listed as u32);
 
-    // Fund the invoice via pool
-    let pool = mock_pool_with_asset(&env, &usdc);
-    client.set_pool_contract(&pool);
-    let funded_amount: u128 = 980_000_000;
-    let result = client.mark_funded(&invoice_id, &pool, &usdc, &funded_amount);
-    assert!(result);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Funded);
-    assert_eq!(client.get(&invoice_id).funding_pool, Some(pool.clone()));
+    // Fund via pool (goes through escrow lock + invoice.mark_funded)
+    let stats_before_fund = pool.get_stats();
+    pool.fund_invoice(&inv_id);
+    assert_eq!(invoice.get_status(&inv_id), InvoiceStatus::Funded as u32);
 
-    // Ship the invoice
-    client.mark_shipped(&invoice_id);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Active);
+    let inv_data = invoice.get(&inv_id);
+    assert_eq!(inv_data.funding_pool, Some(pool_id));
 
-    // Both parties confirm delivery
-    client.confirm_delivery(&invoice_id, &issuer);
-    client.confirm_delivery(&invoice_id, &buyer);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Confirmed);
+    let stats_after_fund = pool.get_stats();
+    assert_eq!(stats_after_fund.active_invoice_count, 1);
+    assert!(stats_after_fund.total_funded > stats_before_fund.total_funded);
+    assert!(stats_after_fund.available_liquidity < stats_before_fund.available_liquidity);
 
-    // Capture pool stats before repayment
-    let pool_client = PoolContractClient::new(&env, &pool);
-    let stats_before = pool_client.get_stats();
-    let total_yield_before = stats_before.total_yield_distributed;
+    // Mark shipped
+    invoice.mark_shipped(&inv_id);
+    assert_eq!(invoice.get_status(&inv_id), InvoiceStatus::Active as u32);
 
-    // Repay the invoice
-    let repay_result = client.repay(&invoice_id);
-    assert!(repay_result);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Repaid);
+    // Both confirm delivery
+    invoice.confirm_delivery(&inv_id, &issuer);
+    assert!(invoice.get(&inv_id).issuer_confirmed);
+    assert!(!invoice.get(&inv_id).buyer_confirmed);
+    assert_eq!(invoice.get_status(&inv_id), InvoiceStatus::Active as u32);
 
-    // Verify pool yield increased after repayment
-    let pool_client = PoolContractClient::new(&env, &pool);
-    let stats_after = pool_client.get_stats();
-    assert!(stats_after.total_yield_distributed > total_yield_before);
+    invoice.confirm_delivery(&inv_id, &buyer);
+    assert!(invoice.get(&inv_id).issuer_confirmed);
+    assert!(invoice.get(&inv_id).buyer_confirmed);
+    assert_eq!(invoice.get_status(&inv_id), InvoiceStatus::Confirmed as u32);
+
+    // Repay
+    let stats_before_repay = pool.get_stats();
+    invoice.repay(&inv_id);
+    assert_eq!(invoice.get_status(&inv_id), InvoiceStatus::Repaid as u32);
+
+    // Assert pool yield increased
+    let stats_after_repay = pool.get_stats();
+    assert!(stats_after_repay.total_yield_distributed > stats_before_repay.total_yield_distributed);
+    assert_eq!(stats_after_repay.active_invoice_count, 0);
 }
